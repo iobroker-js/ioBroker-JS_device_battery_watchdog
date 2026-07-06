@@ -1,0 +1,192 @@
+// ============================================================
+// Monitors battery status of Zigbee and Fritz! devices
+// Sends warning messages via Telegram when battery is low,
+// critical, or when a connection is lost.
+// ============================================================
+// Author   : speefak
+// Name	    : battery_check_polling
+// Created  : 2026-05-20
+// Version  : 0.4
+// Adapter  : iobroker.javascript
+// Requires : Telegram Adapter (telegram.0)
+// ============================================================
+
+// ===== CONFIG =====
+const CHECK_INTERVAL = 900;           // battery check interval (s)
+const THRESHOLD1 = 15;                // low battery threshold (%)
+const MESSAGE_INTERVAL1 = 86400;      // interval for <10% alerts (s)
+const THRESHOLD2 = 5;                 // critical battery threshold (%)
+const MESSAGE_INTERVAL2 = 3600;       // interval for <5% alerts (s)
+const THRESHOLD3 = 3600;              // connection lost threshold - no state update (s)
+const MESSAGE_INTERVAL3 = 3600;       // interval for lost connection alerts (s)
+
+const TELEGRAM_INSTANCE = 'telegram.0';
+const TELEGRAM_USER = '';           // optional target user
+
+const LAST_MSG_STATE = '0_userdata.0.batteryWarnings.lastMsg';
+
+// ===== INIT STATE =====
+createState(LAST_MSG_STATE, JSON.stringify({ t1: 0, t2: 0, t3: 0 }), {
+    type: 'string',
+    read: true,
+    write: true,
+    def: JSON.stringify({ t1: 0, t2: 0, t3: 0 })
+});
+
+// ===== FUNCTIONS =====
+function getBatteryStates() {
+    const states = [];
+
+    $('zigbee.*.battery').each(id => states.push(id));
+    $('fritzdect.*.battery').each(id => states.push(id));   // Fritz DECT devices
+    $('fritzbox.*.battery').each(id => states.push(id));    // if available
+
+    return states;
+}
+
+function getDeviceName(id) {
+    const parts = id.split('.');
+    if (parts.length >= 4) {
+        const deviceId = parts.slice(0, 3).join('.');
+        const obj = getObject(deviceId);
+        if (obj?.common?.name) return obj.common.name;
+    }
+    return id;
+}
+
+function sendTelegram(msg) {
+    sendTo(TELEGRAM_INSTANCE, 'send', {
+        text: msg,
+        user: TELEGRAM_USER || undefined
+    });
+    console.log(msg);   // also to log
+}
+
+// ===== FIRST RUN (send all devices immediately) =====
+function sendInitialBatteryReport() {
+    const now = Date.now();
+    const startTime = new Date().toLocaleString('de-DE');   // e.g. 21.04.2026, 16:05:12
+
+    let warn1 = [];
+    let warn2 = [];
+    let warn3 = [];
+    let allDevices = [];
+
+    getBatteryStates().forEach(id => {
+        const s = getState(id);
+        if (!s || s.val === null) return;
+
+        const name = getDeviceName(id);
+        const val = parseFloat(s.val);
+        if (isNaN(val)) return;
+
+        // Connection lost: last update too long ago AND battery was already low
+        if (s.ts && (now - s.ts) >= THRESHOLD3 * 1000 && val < THRESHOLD1) {
+            warn3.push(`${name} (${val}%, ${Math.round((now - s.ts) / 60000)} min ago)`);
+            return;
+        }
+
+        allDevices.push(`${name} (${val}%)`);
+
+        if (val < THRESHOLD2) {
+            warn2.push(`${name} (${val}%)`);
+        } else if (val < THRESHOLD1) {
+            warn1.push(`${name} (${val}%)`);
+        }
+    });
+
+    // Message text:
+    let message = `🔋 Battery Check started \n ${startTime}\n `;
+    message += `(${allDevices.length} devices found)\n\n`;
+
+    if (warn2.length) {
+        message += `🔴 Battery critical (<${THRESHOLD2}%):\n${warn2.join('\n')}\n\n`;
+    }
+    if (warn1.length) {
+        message += `🟠 Battery low (<${THRESHOLD1}%):\n${warn1.join('\n')}\n\n`;
+    }
+    if (warn3.length) {
+        message += `📡 Connection lost (>${Math.round(THRESHOLD3 / 60)} min without update):\n${warn3.join('\n')}\n\n`;
+    }
+
+    if (allDevices.length === 0 && warn3.length === 0) {
+        message += "No battery devices found.";
+    } else if (warn2.length === 0 && warn1.length === 0 && warn3.length === 0) {
+        message += "All devices have sufficient battery.";
+    }
+
+    sendTelegram(message.trim());
+
+    // Set timings only now
+    setState(LAST_MSG_STATE, JSON.stringify({ t1: now, t2: now, t3: now }), true);
+}
+
+// ===== MAIN LOOP =====
+const CHECK_INTERVAL_MS = CHECK_INTERVAL * 1000;
+const MESSAGE_INTERVAL1_MS = MESSAGE_INTERVAL1 * 1000;
+const MESSAGE_INTERVAL2_MS = MESSAGE_INTERVAL2 * 1000;
+const MESSAGE_INTERVAL3_MS = MESSAGE_INTERVAL3 * 1000;
+
+setInterval(function () {
+    const now = Date.now();
+    let lastMsg;
+
+    try {
+        lastMsg = JSON.parse(getState(LAST_MSG_STATE).val);
+    } catch (e) {
+        lastMsg = { t1: 0, t2: 0, t3: 0 };
+    }
+
+    let warn1 = [];
+    let warn2 = [];
+    let warn3 = [];
+
+    getBatteryStates().forEach(id => {
+        const s = getState(id);
+        if (!s || s.val === null) return;
+
+        const name = getDeviceName(id);
+        const val = parseFloat(s.val);
+        if (isNaN(val)) return;
+
+        // Connection lost: last update too long ago AND battery was already low
+        if (s.ts && (now - s.ts) >= THRESHOLD3 * 1000 && val < THRESHOLD1) {
+            warn3.push(`${name} (${val}%, ${Math.round((now - s.ts) / 60000)} min ago)`);
+            return;
+        }
+
+        if (val < THRESHOLD2) {
+            warn2.push(`${name} (${val}%)`);
+        } else if (val < THRESHOLD1) {
+            warn1.push(`${name} (${val}%)`);
+        }
+    });
+
+    let message = '';
+
+    // 🔴 critical
+    if (warn2.length && (now - (lastMsg.t2 || 0) >= MESSAGE_INTERVAL2_MS)) {
+        message += `🔴 Battery critical (<${THRESHOLD2}%):\n${warn2.join('\n')}\n\n`;
+        lastMsg.t2 = now;
+    }
+
+    // 🟠 low
+    if (warn1.length && (now - (lastMsg.t1 || 0) >= MESSAGE_INTERVAL1_MS)) {
+        message += `🟠 Battery low (<${THRESHOLD1}%):\n${warn1.join('\n')}\n\n`;
+        lastMsg.t1 = now;
+    }
+
+    // 📡 connection lost
+    if (warn3.length && (now - (lastMsg.t3 || 0) >= MESSAGE_INTERVAL3_MS)) {
+        message += `📡 Connection lost (>${Math.round(THRESHOLD3 / 60)} min without update):\n${warn3.join('\n')}`;
+        lastMsg.t3 = now;
+    }
+
+    if (message) {
+        sendTelegram(message.trim());
+        setState(LAST_MSG_STATE, JSON.stringify(lastMsg), true);
+    }
+}, CHECK_INTERVAL_MS);
+
+// ===== START FIRST RUN DIRECTLY =====
+sendInitialBatteryReport();
