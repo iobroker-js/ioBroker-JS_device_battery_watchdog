@@ -1,4 +1,4 @@
-# device_battery_watchdog
+# ioBroker-JS Device Battery Watchdog
 
 An ioBroker JavaScript that monitors the battery status of Zigbee and Fritz! devices and sends Telegram alerts for low battery, critical battery, and lost device connections.
 
